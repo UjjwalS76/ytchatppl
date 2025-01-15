@@ -1,0 +1,5 @@
+streamlit 
+youtube-transcript-api 
+langchain-openai 
+langchain-google-genai
+chromadb
