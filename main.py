@@ -1,92 +1,155 @@
 import streamlit as st
+from langchain.schema import Document
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
-from langchain.chains import ConversationalRetrievalChain
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
-from langchain.vectorstores import Chroma
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.chat_models import ChatOpenAI
+from langchain_community.vectorstores import Chroma
 
-# Set up Streamlit page configuration
-st.set_page_config(page_title="YouTube Chatbot", layout="wide")
+# Page config
+st.set_page_config(
+    page_title="YouTube Video Chat",
+    page_icon="🎥",
+    layout="wide"
+)
 
-# Title of the app
-st.title("Chat with YouTube Videos")
+# Initialize session states
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'ready' not in st.session_state:
+    st.session_state.ready = False
 
-# Step 1: Securely input Google API key using Streamlit Secrets
-st.sidebar.header("API Key Configuration")
-google_api_key = st.sidebar.text_input("Enter your Google API Key", type="password")
-if google_api_key:
-    st.session_state["google_api_key"] = google_api_key
+# Title
+st.title("🎥 YouTube Video Chatbot")
 
-# Step 2: Input YouTube video link
-video_url = st.text_input("Enter the YouTube video URL:")
-
-# Helper function to extract video ID from URL
 def get_video_id(url):
+    """Extract video ID from YouTube URL"""
     parsed_url = urlparse(url)
-    if parsed_url.hostname == "youtu.be":
+    if parsed_url.hostname == 'youtu.be':
         return parsed_url.path[1:]
-    if parsed_url.hostname in ["www.youtube.com", "youtube.com"]:
-        if parsed_url.path == "/watch":
-            return parse_qs(parsed_url.query).get("v", [None])[0]
+    if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
+        if parsed_url.path == '/watch':
+            return parse_qs(parsed_url.query)['v'][0]
     return None
 
-# Step 3: Load and process video transcript
-if video_url:
-    video_id = get_video_id(video_url)
-    if video_id:
-        try:
-            st.write(f"Fetching transcript for video ID: {video_id}...")
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            full_text = " ".join([entry["text"] for entry in transcript])
+def load_video_transcript(video_url):
+    """Load and process YouTube video transcript"""
+    try:
+        video_id = get_video_id(video_url)
+        if not video_id:
+            st.error("Could not extract video ID from URL")
+            return None
             
-            # Split text into chunks for better processing
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-            documents = text_splitter.split_text(full_text)
+        # Get transcript
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        
+        # Combine transcript text
+        full_text = ' '.join([entry['text'] for entry in transcript])
+        
+        # Create document
+        return Document(
+            page_content=full_text,
+            metadata={"source": video_url}
+        )
+        
+    except Exception as e:
+        st.error(f"Error loading transcript: {str(e)}")
+        return None
 
-            # Display first few lines of the transcript
-            st.write("Transcript loaded successfully!")
-            st.write("First 500 characters of the transcript:")
-            st.write(full_text[:500])
+def initialize_chat_engine(document):
+    """Initialize the chat engine with the document"""
+    try:
+        # Split text
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        splits = text_splitter.split_documents([document])
 
-            # Step 4: Set up LangChain components for chat functionality
-            embeddings = OpenAIEmbeddings(openai_api_key=st.session_state["google_api_key"])
-            vector_store = Chroma.from_documents(documents, embeddings)
-            memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-            retriever_chain = ConversationalRetrievalChain.from_llm(
-                llm=ChatOpenAI(temperature=0, openai_api_key=st.session_state["google_api_key"]),
-                retriever=vector_store.as_retriever(),
-                memory=memory,
-            )
+        # Create embeddings and vectorstore
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        vectorstore = Chroma.from_documents(splits, embeddings)
 
-            # Step 5: Chat Interface
-            st.subheader("Chat with the Video")
-            if "messages" not in st.session_state:
-                st.session_state.messages = []
+        # Initialize LLM
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash-002",
+            temperature=0.7,
+            top_k=3,
+            top_p=0.8,
+            max_output_tokens=2048
+        )
 
-            # Display chat history on app rerun
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
+        # Create memory
+        memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
 
-            # Accept user input and generate responses
-            user_input = st.chat_input("Ask something about the video...")
-            if user_input:
-                with st.chat_message("user"):
-                    st.markdown(user_input)
-                st.session_state.messages.append({"role": "user", "content": user_input})
+        # Create chain
+        chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
+            memory=memory,
+            return_source_documents=True
+        )
+        
+        return chain
 
-                # Generate response from LangChain retriever chain
-                response = retriever_chain.run(user_input)
-                with st.chat_message("assistant"):
-                    st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
+    except Exception as e:
+        st.error(f"Error initializing chat engine: {str(e)}")
+        return None
 
-        except Exception as e:
-            st.error(f"Error fetching transcript: {str(e)}")
-    else:
-        st.error("Invalid YouTube URL. Please enter a valid link.")
+# Sidebar
+with st.sidebar:
+    st.header("📝 Video Input")
+    video_url = st.text_input(
+        "Enter YouTube Video URL:",
+        placeholder="https://www.youtube.com/watch?v=..."
+    )
+    
+    if video_url:
+        with st.spinner("Loading video transcript..."):
+            doc = load_video_transcript(video_url)
+            if doc:
+                with st.spinner("Initializing chat engine..."):
+                    qa_chain = initialize_chat_engine(doc)
+                    if qa_chain:
+                        st.session_state.qa_chain = qa_chain
+                        st.session_state.ready = True
+                        st.success("✅ Ready to chat!")
+                    else:
+                        st.error("Failed to initialize chat engine")
+
+# Main chat interface
+if st.session_state.ready:
+    # Chat interface
+    st.header("💬 Chat with Video Content")
+    
+    # Display messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask a question about the video..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+            
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    response = st.session_state.qa_chain({"question": prompt})
+                    st.markdown(response['answer'])
+                    st.session_state.messages.append({"role": "assistant", "content": response['answer']})
+                except Exception as e:
+                    st.error(f"Error generating response: {str(e)}")
 else:
-    st.info("Please enter a YouTube URL to begin.")
+    st.info("👆 Enter a YouTube URL in the sidebar to start chatting!")
+
+# Footer
+st.markdown("---")
+st.markdown("Made with ❤️ using Streamlit and LangChain")
